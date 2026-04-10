@@ -270,7 +270,8 @@ class UNet(nn.Module):
         for level_blocks, downsample in zip(self.down_blocks, self.down_samples):
             for block in level_blocks:
                 h = block(h, emb) if isinstance(block, ResBlock) else block(h)
-                skips.append(h)
+                if isinstance(block, ResBlock):
+                    skips.append(h)
             if downsample is not None:
                 h = downsample(h)
                 skips.append(h)
