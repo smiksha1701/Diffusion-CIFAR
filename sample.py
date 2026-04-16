@@ -136,4 +136,4 @@ if __name__ == "__main__":
     os.makedirs(os.path.dirname(args.out_path) or ".", exist_ok=True)
     nrow = int(args.n ** 0.5)
     save_image(imgs, args.out_path, nrow=nrow)
-    print(f"Saved {args.n} images → {args.out_path}")
+    print(f"Saved {args.n} images -> {args.out_path}")

@@ -39,7 +39,7 @@ class Config:
     total_steps: int = 700_000
     warmup_steps: int = 5_000
     grad_clip: float = 1.0
-    num_workers: int = 4
+    num_workers: int = 0
 
     # ── Sampling ──────────────────────────────────────────────────────────────
     sampler: str = "ddim"             # "ddpm" | "ddim"

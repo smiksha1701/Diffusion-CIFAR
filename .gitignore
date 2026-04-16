@@ -1,0 +1,12 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# ML Checkpoints and Data
+checkpoints/
+data/
+*.tar.gz
+*.pt
+
+# Generated samples
+samples/

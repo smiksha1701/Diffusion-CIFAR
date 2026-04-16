@@ -5,6 +5,7 @@ Images are returned in [-1, 1] with random horizontal flip for training.
 """
 
 import torch
+import torch.utils.data
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
@@ -42,16 +43,16 @@ def get_loaders(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,
         drop_last=True,
-        persistent_workers=num_workers > 0,
+        persistent_workers=False,
     )
     test_loader = DataLoader(
         test_ds,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=num_workers > 0,
+        pin_memory=False,
+        persistent_workers=False,
     )
     return train_loader, test_loader

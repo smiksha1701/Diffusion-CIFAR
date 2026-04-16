@@ -40,8 +40,10 @@ class EMA:
 
     @torch.no_grad()
     def update(self, model: torch.nn.Module):
-        for s, m in zip(self.shadow.parameters(), model.parameters()):
-            s.copy_(self.decay * s + (1 - self.decay) * m)
+        # foreach ops batch all parameter updates into a single CUDA kernel launch
+        shadow = list(self.shadow.parameters())
+        online = list(model.parameters())
+        torch._foreach_lerp_(shadow, online, 1.0 - self.decay)
 
     def state_dict(self):
         return self.shadow.state_dict()
@@ -96,8 +98,21 @@ def train(cfg: Config, resume: str = None):
         optimizer, lr_lambda=lambda s: warmup_lambda(s, cfg.warmup_steps)
     )
 
-    # ── Data ──────────────────────────────────────────────────────────────────
-    train_loader, _ = get_loaders(cfg.dataset, cfg.batch_size, cfg.num_workers)
+    # ── Data — preload entire dataset onto GPU (CIFAR fits easily) ───────────
+    print("Preloading dataset onto GPU...")
+    train_loader, _ = get_loaders(cfg.dataset, 1024, cfg.num_workers)
+    all_x, all_y = [], []
+    for xb, yb in train_loader:
+        all_x.append(xb)
+        all_y.append(yb)
+    all_x = torch.cat(all_x).to(device)   # (N, 3, 32, 32)
+    all_y = torch.cat(all_y).to(device)   # (N,)
+    N = all_x.shape[0]
+    print(f"Dataset on GPU: {all_x.shape}  ({all_x.nbytes / 1e6:.0f} MB)")
+
+    def next_batch():
+        idx = torch.randint(0, N, (cfg.batch_size,), device=device)
+        return all_x[idx], all_y[idx]
 
     # ── Resume ────────────────────────────────────────────────────────────────
     step = 0
@@ -110,13 +125,6 @@ def train(cfg: Config, resume: str = None):
         step = ckpt["step"]
         print(f"Resumed from step {step}")
 
-    # ── Compile (optional speedup on PyTorch >= 2.0) ──────────────────────────
-    try:
-        model = torch.compile(model)
-        print("Model compiled with torch.compile()")
-    except Exception:
-        pass
-
     # ── Fixed eval labels (one of each class, tiled to fill the grid) ─────────
     if cfg.class_cond:
         n = cfg.sample_grid
@@ -126,43 +134,45 @@ def train(cfg: Config, resume: str = None):
     else:
         eval_labels = None
 
+    # ── Mixed precision ───────────────────────────────────────────────────────
+    scaler = torch.amp.GradScaler("cuda")
+    autocast = torch.amp.autocast("cuda", dtype=torch.bfloat16)
+
     # ── Training loop ─────────────────────────────────────────────────────────
     model.train()
-    data_iter = iter(train_loader)
     t0 = time.time()
     loss_accum = 0.0
 
     while step < cfg.total_steps:
-        try:
-            x0, y = next(data_iter)
-        except StopIteration:
-            data_iter = iter(train_loader)
-            x0, y = next(data_iter)
-
-        x0 = x0.to(device)
-        y  = y.to(device) if cfg.class_cond else None
-
-        loss = diffusion.loss(x0, y, cfg_dropout=cfg.cfg_dropout if cfg.class_cond else 0.0)
+        x0, y = next_batch()
+        y = y if cfg.class_cond else None
 
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        with autocast:
+            loss = diffusion.loss(x0, y, cfg_dropout=cfg.cfg_dropout if cfg.class_cond else 0.0)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         scheduler.step()
         ema.update(model)
-
         loss_accum += loss.item()
         step += 1
 
         if step % cfg.log_every == 0:
             avg_loss = loss_accum / cfg.log_every
             elapsed = time.time() - t0
+            its = cfg.log_every / elapsed
+            steps_per_epoch = N // cfg.batch_size
+            epoch_time = steps_per_epoch / its
             lr_now = scheduler.get_last_lr()[0]
             print(
                 f"Step {step:7d}/{cfg.total_steps} | "
                 f"loss {avg_loss:.4f} | "
                 f"lr {lr_now:.2e} | "
-                f"{elapsed:.1f}s"
+                f"{its:.1f} it/s | "
+                f"epoch {epoch_time:.0f}s"
             )
             loss_accum = 0.0
             t0 = time.time()
@@ -202,7 +212,7 @@ def _save_samples(diffusion, ema_model, cfg, eval_labels, step, device):
     samples = (samples.clamp(-1, 1) + 1) / 2  # → [0, 1]
     path = os.path.join(cfg.sample_dir, f"step_{step:07d}.png")
     save_image(samples, path, nrow=int(cfg.sample_grid ** 0.5))
-    print(f"  Saved samples → {path}")
+    print(f"  Saved samples -> {path}")
     ema_model.train()
 
 
@@ -219,7 +229,7 @@ def _save_checkpoint(cfg, step, model, ema, optimizer, scheduler):
         },
         path,
     )
-    print(f"  Saved checkpoint → {path}")
+    print(f"  Saved checkpoint -> {path}")
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
@@ -232,13 +242,19 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--total_steps", type=int, default=None)
     parser.add_argument("--cfg_scale", type=float, default=None)
+    parser.add_argument("--log_every", type=int, default=None)
+    parser.add_argument("--save_every", type=int, default=None)
+    parser.add_argument("--sample_every", type=int, default=None)
     args = parser.parse_args()
 
     cfg = Config()
-    if args.dataset:     cfg.dataset = args.dataset; cfg.__post_init__()
-    if args.batch_size:  cfg.batch_size = args.batch_size
-    if args.lr:          cfg.lr = args.lr
-    if args.total_steps: cfg.total_steps = args.total_steps
-    if args.cfg_scale:   cfg.cfg_scale = args.cfg_scale
+    if args.dataset:      cfg.dataset = args.dataset; cfg.__post_init__()
+    if args.batch_size:   cfg.batch_size = args.batch_size
+    if args.lr:           cfg.lr = args.lr
+    if args.total_steps:  cfg.total_steps = args.total_steps
+    if args.cfg_scale:    cfg.cfg_scale = args.cfg_scale
+    if args.log_every:    cfg.log_every = args.log_every
+    if args.save_every:   cfg.save_every = args.save_every
+    if args.sample_every: cfg.sample_every = args.sample_every
 
     train(cfg, resume=args.resume)
